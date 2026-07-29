@@ -141,7 +141,9 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
         "The conflict is at:\n" + conflict
     } else {
       val plan = FlinkRelOptUtil.toString(rootWithModifyKindSet, withChangelogTraits = true)
-      "Can't generate a valid execution plan for the given query:\n" + plan
+      "Can't generate a valid execution plan for the given query because of a changelog mismatch: " +
+        "an operator cannot produce the changelog its consumer requires. Review the changelog " +
+        "modes of the operators in the plan below:\n" + plan
     }
   }
 
@@ -404,6 +406,27 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
         // forward left input changes
         val leftTrait = children.head.getTraitSet.getTrait(ModifyKindSetTraitDef.INSTANCE)
         createNewNode(temporalJoin, children, leftTrait, requiredTrait, requester)
+
+      case lateralSnapshotJoin: StreamPhysicalLateralSnapshotJoin =>
+        // LATERAL SNAPSHOT requires append-only on the probe (left) side and supports all
+        // changelog modes on the build (right) side. Output is append-only. Visit the children
+        // individually so a rejected probe input names the probe side, not the whole operator.
+        val leftChild = visitChild(
+          lateralSnapshotJoin,
+          0,
+          ModifyKindSetTrait.INSERT_ONLY,
+          "The probe (left) input of LATERAL SNAPSHOT join")
+        val rightChild = visitChild(
+          lateralSnapshotJoin,
+          1,
+          ModifyKindSetTrait.ALL_CHANGES,
+          getNodeName(lateralSnapshotJoin))
+        createNewNode(
+          lateralSnapshotJoin,
+          List(leftChild, rightChild),
+          ModifyKindSetTrait.INSERT_ONLY,
+          requiredTrait,
+          requester)
 
       case multiJoin: StreamPhysicalMultiJoin =>
         // multi-join supports all changes in input
@@ -738,6 +761,23 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
               None
           }
 
+        case lateralSnapshotJoin: StreamPhysicalLateralSnapshotJoin =>
+          // Probe (left) is required to be append-only.
+          // Build (right) side requires BEFORE_AND_AFTER for updates.
+          val left = lateralSnapshotJoin.getLeft.asInstanceOf[StreamPhysicalRel]
+          val right = lateralSnapshotJoin.getRight.asInstanceOf[StreamPhysicalRel]
+          val newLeftOption = this.visit(left, UpdateKindTrait.NONE)
+          val rightInputModifyKindSet = getModifyKindSet(right)
+          val newRightOption = this.visit(right, beforeAfterOrNone(rightInputModifyKindSet))
+          (newLeftOption, newRightOption) match {
+            case (Some(newLeft), Some(newRight)) =>
+              createNewNode(
+                lateralSnapshotJoin,
+                Some(List(newLeft, newRight)),
+                UpdateKindTrait.NONE)
+            case _ => None
+          }
+
         // if the condition is applied on the upsert key, we can emit whatever the requiredTrait
         // is, because we will filter all records based on the condition that applies to that key
         case calc: StreamPhysicalCalcBase =>
@@ -857,7 +897,7 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
           // input traits, partition keys, and upsert keys
           val inputArgs = StreamPhysicalProcessTableFunction
             .getProvidedInputArgs(process.getCall)
-          val children = process.getInputs
+          val childOpts = process.getInputs
             .map(_.asInstanceOf[StreamPhysicalRel])
             .zipWithIndex
             .map {
@@ -888,15 +928,20 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
                 }
             }
             .toList
-            .flatten
-          // Query PTF for upsert vs. retract
-          val providedUpdateTrait = queryPtfChangelogMode(
-            process,
-            children,
-            toChangelogMode(process, Some(requiredUpdateTrait), None),
-            UpdateKindTrait.fromChangelogMode,
-            UpdateKindTrait.NONE)
-          createNewNode(rel, Some(children), providedUpdateTrait)
+
+          if (childOpts.exists(_.isEmpty)) {
+            None
+          } else {
+            val children = childOpts.flatten
+            // Query PTF for upsert vs. retract
+            val providedUpdateTrait = queryPtfChangelogMode(
+              process,
+              children,
+              toChangelogMode(process, Some(requiredUpdateTrait), None),
+              UpdateKindTrait.fromChangelogMode,
+              UpdateKindTrait.NONE)
+            createNewNode(rel, Some(children), providedUpdateTrait)
+          }
 
         case multiJoin: StreamPhysicalMultiJoin =>
           val onlyAfterByParent = requiredUpdateTrait.updateKind == UpdateKind.ONLY_UPDATE_AFTER
@@ -1067,15 +1112,19 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
      * <p>Notice: even if sink pk is a subset of the upsert key, the pk is NOT considered satisfied
      * when the upsert key has columns outside sink pk. This differs from batch job's unique key
      * inference.
+     *
+     * <p>A sink without a primary key is satisfied whenever the input carries any upsert key.
      */
     private def canUpsertKeysWithImmutableColsSatisfyPk(sink: StreamPhysicalSink): Boolean = {
       val sinkDefinedPks = sink.contextResolvedTable.getResolvedSchema.getPrimaryKeyIndexes
-      if (sinkDefinedPks.isEmpty) {
-        return true
-      }
-      val sinkPks = ImmutableBitSet.of(sinkDefinedPks: _*)
       val fmq = FlinkRelMetadataQuery.reuseOrCreate(sink.getCluster.getMetadataQuery)
       val changeLogUpsertKeys = fmq.getUpsertKeys(sink.getInput)
+      if (sinkDefinedPks.isEmpty) {
+        // A keyless sink cannot apply UPDATE_AFTER in place, so it can only accept upsert when the
+        // input itself carries an upsert key; otherwise fall back to beforeAndAfter.
+        return changeLogUpsertKeys != null && !changeLogUpsertKeys.isEmpty
+      }
+      val sinkPks = ImmutableBitSet.of(sinkDefinedPks: _*)
       // if upsert key is null, pk cannot be satisfied, should fall back to beforeAndAfter
       if (changeLogUpsertKeys == null) {
         return false
@@ -1259,13 +1308,14 @@ class FlinkChangelogModeInferenceProgram extends FlinkOptimizeProgram[StreamOpti
             _: StreamPhysicalPythonGroupTableAggregate | _: StreamPhysicalGroupWindowAggregateBase |
             _: StreamPhysicalWindowAggregate | _: StreamPhysicalSort | _: StreamPhysicalRank |
             _: StreamPhysicalSortLimit | _: StreamPhysicalTemporalJoin |
-            _: StreamPhysicalCorrelateBase | _: StreamPhysicalLookupJoin |
-            _: StreamPhysicalWatermarkAssigner | _: StreamPhysicalWindowTableFunction |
-            _: StreamPhysicalWindowRank | _: StreamPhysicalWindowDeduplicate |
-            _: StreamPhysicalTemporalSort | _: StreamPhysicalMatch |
-            _: StreamPhysicalOverAggregate | _: StreamPhysicalIntervalJoin |
-            _: StreamPhysicalPythonOverAggregate | _: StreamPhysicalWindowJoin |
-            _: StreamPhysicalMLPredictTableFunction | _: StreamPhysicalVectorSearchTableFunction =>
+            _: StreamPhysicalLateralSnapshotJoin | _: StreamPhysicalCorrelateBase |
+            _: StreamPhysicalLookupJoin | _: StreamPhysicalWatermarkAssigner |
+            _: StreamPhysicalWindowTableFunction | _: StreamPhysicalWindowRank |
+            _: StreamPhysicalWindowDeduplicate | _: StreamPhysicalTemporalSort |
+            _: StreamPhysicalMatch | _: StreamPhysicalOverAggregate |
+            _: StreamPhysicalIntervalJoin | _: StreamPhysicalPythonOverAggregate |
+            _: StreamPhysicalWindowJoin | _: StreamPhysicalMLPredictTableFunction |
+            _: StreamPhysicalVectorSearchTableFunction =>
           // if not explicitly supported, all operators require full deletes if there are updates
           val children = rel.getInputs.map {
             case child: StreamPhysicalRel =>
