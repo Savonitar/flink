@@ -675,8 +675,12 @@ class RocksDBMapState<K, N, UK, UV> extends AbstractRocksDBState<K, N, Map<UK, U
                 /*
                  * If the entry pointing to the current position is not removed, it will be the first entry in the
                  * new iterating. Skip it to avoid redundant access in such cases.
+                 *
+                 * Removing the current entry through MapState does not update its cached 'deleted' flag.
+                 * A resumed seek can therefore return an invalid iterator even if 'deleted' is false.
+                 * RocksDB requires a valid iterator before calling next().
                  */
-                if (currentEntry != null && !currentEntry.deleted) {
+                if (currentEntry != null && !currentEntry.deleted && iterator.isValid()) {
                     iterator.next();
                 }
 

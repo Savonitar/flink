@@ -90,8 +90,10 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.RunnableFuture;
 import java.util.stream.Collectors;
@@ -683,6 +685,51 @@ public class EmbeddedRocksDBStateBackendTest
                 .newIterator(any(ColumnFamilyHandle.class), any(ReadOptions.class));
 
         assertThatThrownBy(state::clear).isInstanceOf(FlinkRuntimeException.class);
+    }
+
+    @TestTemplate
+    public void testMapStateIteratorDoesNotAdvanceAfterExhaustedSeek() throws Exception {
+        setupRocksKeyedStateBackend();
+        final MapStateDescriptor<Integer, Integer> descriptor =
+                new MapStateDescriptor<>("map", IntSerializer.INSTANCE, IntSerializer.INSTANCE);
+        keyedStateBackend.setCurrentKey(0);
+        final MapState<Integer, Integer> state =
+                keyedStateBackend.getPartitionedState(
+                        VoidNamespace.INSTANCE, VoidNamespaceSerializer.INSTANCE, descriptor);
+
+        doAnswer(
+                        invocation -> {
+                            final RocksIterator rocksIterator =
+                                    spy((RocksIterator) invocation.callRealMethod());
+                            allCreatedCloseables.add(rocksIterator);
+                            // Check the native precondition even when RocksDB assertions are
+                            // disabled.
+                            doAnswer(
+                                            nextInvocation -> {
+                                                assertThat(rocksIterator.isValid())
+                                                        .as("next() requires a valid iterator")
+                                                        .isTrue();
+                                                return nextInvocation.callRealMethod();
+                                            })
+                                    .when(rocksIterator)
+                                    .next();
+                            return rocksIterator;
+                        })
+                .when(keyedStateBackend.db)
+                .newIterator(any(ColumnFamilyHandle.class), any(ReadOptions.class));
+
+        // One entry beyond the 128-entry cache ensures the next hasNext() refills it.
+        for (int i = 0; i < 129; i++) {
+            state.put(i, i);
+        }
+        final Iterator<Map.Entry<Integer, Integer>> iterator = state.iterator();
+        for (int i = 0; i < 128; i++) {
+            assertThat(iterator.next().getKey()).isEqualTo(i);
+        }
+        state.remove(127);
+        state.remove(128);
+
+        assertThat(iterator.hasNext()).isFalse();
     }
 
     /** Test for all configs that use {@link org.apache.flink.util.TernaryBoolean}. */
