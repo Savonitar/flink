@@ -38,6 +38,7 @@ import org.rocksdb.ImportColumnFamilyOptions;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.Slice;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -111,6 +112,59 @@ public class RocksDBOperationUtils {
     public static RocksIteratorWrapper getRocksIterator(
             RocksDB db, ColumnFamilyHandle columnFamilyHandle, ReadOptions readOptions) {
         return new RocksIteratorWrapper(db.newIterator(columnFamilyHandle, readOptions));
+    }
+
+    static RocksIteratorWrapper getRocksIteratorBoundedByPrefix(
+            RocksDB db,
+            ColumnFamilyHandle columnFamilyHandle,
+            ReadOptions readOptions,
+            byte[] prefix) {
+        final byte[] prefixEnd = getPrefixEnd(prefix);
+        if (prefixEnd == null) {
+            return getRocksIterator(db, columnFamilyHandle, readOptions);
+        }
+
+        final Slice upperBound = new Slice(prefixEnd);
+        ReadOptions boundedReadOptions = null;
+        try {
+            boundedReadOptions = new ReadOptions(readOptions);
+            boundedReadOptions.setIterateUpperBound(upperBound);
+            // Auto-prefix mode is needed because, with a prefix extractor configured, the default
+            // seek mode honors the upper bound only if it shares the seek key's extracted prefix.
+            boundedReadOptions.setAutoPrefixMode(true);
+            // The native iterator must stop before looking for a live key beyond the prefix,
+            // which could otherwise require scanning through unrelated tombstones.
+            return new RocksIteratorWrapper(
+                    db.newIterator(columnFamilyHandle, boundedReadOptions),
+                    boundedReadOptions,
+                    upperBound);
+        } catch (RuntimeException | Error e) {
+            IOUtils.closeQuietly(boundedReadOptions);
+            IOUtils.closeQuietly(upperBound);
+            throw e;
+        }
+    }
+
+    /**
+     * Returns the smallest key that is greater than every key starting with {@code prefix}, i.e.
+     * the exclusive upper bound of the prefix range: trailing {@code 0xFF} bytes are dropped and
+     * the last remaining byte is incremented.
+     *
+     * <p>Returns {@code null} when no such key exists. An empty prefix covers the whole column
+     * family, and a prefix consisting only of {@code 0xFF} bytes is the largest prefix of its
+     * length, so every key at or after it starts with it. In both cases an unbounded iterator
+     * cannot reach entries outside the prefix and is therefore correct.
+     */
+    @Nullable
+    private static byte[] getPrefixEnd(byte[] prefix) {
+        for (int i = prefix.length - 1; i >= 0; --i) {
+            if (prefix[i] != (byte) 0xFF) {
+                final byte[] prefixEnd = Arrays.copyOf(prefix, i + 1);
+                ++prefixEnd[i];
+                return prefixEnd;
+            }
+        }
+        return null;
     }
 
     public static void registerKvStateInformation(
