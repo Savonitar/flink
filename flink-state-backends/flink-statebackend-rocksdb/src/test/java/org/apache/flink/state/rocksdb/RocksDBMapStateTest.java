@@ -21,7 +21,12 @@ package org.apache.flink.state.rocksdb;
 import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.api.common.typeutils.base.MapSerializer;
+import org.apache.flink.api.common.typeutils.base.array.IntPrimitiveArraySerializer;
+import org.apache.flink.core.memory.DataOutputView;
+import org.apache.flink.queryablestate.client.state.serialization.KvStateSerializer;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.internal.InternalMapState;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.IOUtils;
 
@@ -42,6 +47,7 @@ import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.TableProperties;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -49,6 +55,7 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -158,6 +165,50 @@ class RocksDBMapStateTest {
                     .hasRootCauseInstanceOf(RocksDBException.class)
                     .hasRootCauseMessage("Too many internal keys skipped.");
         }
+    }
+
+    @Test
+    void testQueryableMapStopsAtNextRefillWhenBackendCloses() throws Exception {
+        final InternalMapState<Integer, Integer, Integer, int[]> state =
+                backend.createOrUpdateInternalState(
+                        IntSerializer.INSTANCE,
+                        new MapStateDescriptor<>(
+                                "query",
+                                IntSerializer.INSTANCE,
+                                IntPrimitiveArraySerializer.INSTANCE));
+        backend.setCurrentKey(0);
+        state.setCurrentNamespace(0);
+        for (int i = 0; i <= ITERATOR_CACHE_SIZE; i++) {
+            state.put(i, new int[] {i});
+        }
+
+        final AtomicInteger serializedEntries = new AtomicInteger();
+        final IntPrimitiveArraySerializer queryValueSerializer =
+                new IntPrimitiveArraySerializer() {
+                    @Override
+                    public void serialize(int[] value, DataOutputView target) throws IOException {
+                        if (serializedEntries.getAndIncrement() == 0) {
+                            // Shutdown can start while the query serializes its first cached batch.
+                            assertThat(backend.getResourceGuard().getLeaseCount()).isZero();
+                            backend.getResourceGuard().close();
+                        }
+                        super.serialize(value, target);
+                    }
+                };
+        final byte[] keyAndNamespace =
+                KvStateSerializer.serializeKeyAndNamespace(
+                        0, IntSerializer.INSTANCE, 0, IntSerializer.INSTANCE);
+        assertThatThrownBy(
+                        () ->
+                                state.getSerializedValue(
+                                        keyAndNamespace,
+                                        IntSerializer.INSTANCE,
+                                        IntSerializer.INSTANCE,
+                                        new MapSerializer<>(
+                                                IntSerializer.INSTANCE, queryValueSerializer)))
+                .isInstanceOf(FlinkRuntimeException.class)
+                .hasCauseInstanceOf(IOException.class);
+        assertThat(serializedEntries.get()).isEqualTo(ITERATOR_CACHE_SIZE);
     }
 
     @ParameterizedTest

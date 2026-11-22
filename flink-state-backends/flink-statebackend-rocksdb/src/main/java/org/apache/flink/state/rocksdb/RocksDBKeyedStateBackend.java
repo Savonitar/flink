@@ -697,6 +697,10 @@ public class RocksDBKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
         return readOptions;
     }
 
+    ResourceGuard getResourceGuard() {
+        return rocksDBResourceGuard;
+    }
+
     PrefixBoundedIteratorFactory getPrefixBoundedIteratorFactory() {
         return prefixBoundedIteratorFactory;
     }

@@ -39,6 +39,7 @@ import org.apache.flink.runtime.state.ttl.TtlAwareSerializer;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.ResourceGuard;
 import org.apache.flink.util.StateMigrationException;
 
 import org.rocksdb.ColumnFamilyHandle;
@@ -397,6 +398,19 @@ class RocksDBMapState<K, N, UK, UV> extends AbstractRocksDBState<K, N, Map<UK, U
                         inputView) {
 
                     @Override
+                    void readNextBatch() {
+                        // A query can outlive its registry entry. Only the native scan needs a
+                        // lease.
+                        try (ResourceGuard.Lease ignored =
+                                backend.getResourceGuard().acquireResource()) {
+                            super.readNextBatch();
+                        } catch (IOException e) {
+                            throw new FlinkRuntimeException(
+                                    "Cannot query a closed RocksDB backend.", e);
+                        }
+                    }
+
+                    @Override
                     public Map.Entry<UK, UV> next() {
                         return nextEntry();
                     }
@@ -674,7 +688,10 @@ class RocksDBMapState<K, N, UK, UV> extends AbstractRocksDBState<K, N, Map<UK, U
             if (cacheIndex < cacheEntries.size() || expired) {
                 return;
             }
+            readNextBatch();
+        }
 
+        void readNextBatch() {
             // use try-with-resources to ensure RocksIterator can be release even some runtime
             // exception
             // occurred in the below code block.
