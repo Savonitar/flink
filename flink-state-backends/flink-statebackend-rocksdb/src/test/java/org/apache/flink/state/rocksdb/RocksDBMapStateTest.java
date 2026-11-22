@@ -22,6 +22,7 @@ import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.IOUtils;
 
 import org.junit.jupiter.api.AfterEach;
@@ -32,12 +33,18 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DBOptions;
 import org.rocksdb.FlushOptions;
 import org.rocksdb.MutableColumnFamilyOptions;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.RocksIterator;
 import org.rocksdb.TableProperties;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -47,6 +54,7 @@ import java.util.stream.IntStream;
 
 import static org.apache.flink.state.rocksdb.RocksDBMapState.ITERATOR_CACHE_SIZE;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests iteration and prefix isolation of RocksDB map state operations. */
 class RocksDBMapStateTest {
@@ -74,17 +82,46 @@ class RocksDBMapStateTest {
                 RocksDBTestUtils.builderForTestDefaults(
                                 temporaryDirectory.toFile(),
                                 IntSerializer.INSTANCE,
+                                EmbeddedRocksDBStateBackend.PriorityQueueStateType.ROCKSDB,
                                 1,
                                 new KeyGroupRange(0, 0),
-                                Collections.emptyList())
+                                Collections.emptyList(),
+                                new RocksDBResourceContainer(
+                                        PredefinedOptions.DEFAULT, new SkipLimitOptionsFactory()))
                         .build();
         mapState(0, 0);
         columnFamily = backend.getColumnFamilyHandle(STATE_DESCRIPTOR.getName());
         backend.db.setOptions(
                 columnFamily,
                 MutableColumnFamilyOptions.builder().setDisableAutoCompactions(true).build());
-        // Allow the entire map to be deleted, but fail if a seek scans the neighbor's tombstones.
-        backend.getReadOptions().setMaxSkippableInternalKeys(SKIPPABLE_INTERNAL_KEY_LIMIT);
+    }
+
+    /**
+     * Allows the entire map to be deleted, but fails if a seek scans the neighbor's tombstones. The
+     * backend copies its read options for bounded iterators when it is created, so the limit has to
+     * be set at that point.
+     */
+    private static final class SkipLimitOptionsFactory implements RocksDBOptionsFactory {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public DBOptions createDBOptions(
+                DBOptions currentOptions, Collection<AutoCloseable> handlesToClose) {
+            return currentOptions;
+        }
+
+        @Override
+        public ColumnFamilyOptions createColumnOptions(
+                ColumnFamilyOptions currentOptions, Collection<AutoCloseable> handlesToClose) {
+            return currentOptions;
+        }
+
+        @Override
+        public ReadOptions createReadOptions(
+                ReadOptions currentOptions, Collection<AutoCloseable> handlesToClose) {
+            return currentOptions.setMaxSkippableInternalKeys(SKIPPABLE_INTERNAL_KEY_LIMIT);
+        }
     }
 
     @AfterEach
@@ -92,6 +129,34 @@ class RocksDBMapStateTest {
         if (backend != null) {
             IOUtils.closeQuietly(backend);
             backend.dispose();
+        }
+    }
+
+    @Test
+    void testUnboundedSeekExceedsSkipLimitOnNeighborTombstones() throws Exception {
+        createNeighborTombstones();
+
+        try (RocksIterator iterator =
+                backend.db.newIterator(columnFamily, backend.getReadOptions())) {
+            iterator.seekToFirst();
+            assertThatThrownBy(iterator::status)
+                    .isInstanceOf(RocksDBException.class)
+                    .hasMessageContaining("Too many internal keys skipped");
+        }
+    }
+
+    @Test
+    void testBoundedIteratorObservesSkipLimit() throws Exception {
+        createNeighborTombstones();
+        // All keys belong to key group zero, so this range includes the deleted neighbor.
+        try (RocksIteratorWrapper iterator =
+                backend.getPrefixBoundedIteratorFactory()
+                        .newIterator(backend.db, columnFamily, new byte[] {0})) {
+            iterator.seekToFirst();
+            assertThatThrownBy(iterator::status)
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasRootCauseInstanceOf(RocksDBException.class)
+                    .hasRootCauseMessage("Too many internal keys skipped.");
         }
     }
 

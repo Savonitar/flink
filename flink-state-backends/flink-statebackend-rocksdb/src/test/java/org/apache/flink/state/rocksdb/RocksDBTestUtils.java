@@ -84,7 +84,24 @@ public final class RocksDBTestUtils {
             KeyGroupRange keyGroupRange,
             @Nonnull Collection<KeyedStateHandle> stateHandles) {
 
-        final RocksDBResourceContainer optionsContainer = new RocksDBResourceContainer();
+        return builderForTestDefaults(
+                instanceBasePath,
+                keySerializer,
+                queueStateType,
+                numKeyGroups,
+                keyGroupRange,
+                stateHandles,
+                new RocksDBResourceContainer());
+    }
+
+    public static <K> RocksDBKeyedStateBackendBuilder<K> builderForTestDefaults(
+            File instanceBasePath,
+            TypeSerializer<K> keySerializer,
+            EmbeddedRocksDBStateBackend.PriorityQueueStateType queueStateType,
+            int numKeyGroups,
+            KeyGroupRange keyGroupRange,
+            @Nonnull Collection<KeyedStateHandle> stateHandles,
+            RocksDBResourceContainer optionsContainer) {
 
         return new RocksDBKeyedStateBackendBuilder<>(
                 "no-op",

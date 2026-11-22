@@ -39,9 +39,17 @@ import org.rocksdb.Snapshot;
 import org.rocksdb.Statistics;
 import org.rocksdb.TickerType;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for prefix bounds and resource ownership of RocksDB iterators. */
 class RocksDBPrefixIteratorTest {
@@ -80,6 +88,12 @@ class RocksDBPrefixIteratorTest {
 
         try (RocksIteratorWrapper iterator =
                 createIterator(rocksDBExtension.getReadOptions(), prefix)) {
+            assertKeys(iterator, prefix, expectedKeys);
+        }
+
+        try (PrefixBoundedIteratorFactory factory =
+                        new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions());
+                RocksIteratorWrapper iterator = createIterator(factory, prefix)) {
             assertKeys(iterator, prefix, expectedKeys);
         }
     }
@@ -142,6 +156,210 @@ class RocksDBPrefixIteratorTest {
     }
 
     @Test
+    void testFactoryIteratorsKeepTheirOwnBounds() throws RocksDBException {
+        final RocksDB db = rocksDBExtension.getRocksDB();
+        // RocksDB opens the files of an iterator lazily. With several files, the iterator still
+        // opens some of them after the factory has replaced the bound for a later iterator.
+        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+            for (int file = 0; file < 3; file++) {
+                putKeys(bytes(1, file), bytes(2, file), bytes(3, file));
+                db.flush(flushOptions, rocksDBExtension.getDefaultColumnFamily());
+            }
+        }
+
+        try (PrefixBoundedIteratorFactory factory =
+                        new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions());
+                RocksIteratorWrapper iterator = createIterator(factory, bytes(2))) {
+            // A later iterator with a smaller bound must not cut this one short, also after the
+            // later iterator has released its bound.
+            try (RocksIteratorWrapper smallerBound = createIterator(factory, bytes(1))) {
+                assertKeys(smallerBound, bytes(1), bytes(1, 0), bytes(1, 1), bytes(1, 2));
+            }
+            assertKeys(iterator, bytes(2), bytes(2, 0), bytes(2, 1), bytes(2, 2));
+
+            // A later iterator with a larger bound must not let this one run past its prefix.
+            try (RocksIteratorWrapper largerBound = createIterator(factory, bytes(3))) {
+                assertKeys(iterator, bytes(2), bytes(2, 0), bytes(2, 1), bytes(2, 2));
+                assertKeys(largerBound, bytes(3), bytes(3, 0), bytes(3, 1), bytes(3, 2));
+            }
+        }
+    }
+
+    @Test
+    void testFactoryReusesBoundAfterIteratorIsClosed() throws RocksDBException {
+        putKeys(bytes(1, 0), bytes(2, 0), bytes(2, 0, 0), bytes(2, 1), bytes(3, 0));
+
+        try (PrefixBoundedIteratorFactory factory =
+                new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions())) {
+            assertReusedBoundKeys(factory, bytes(1), bytes(1, 0));
+            assertReusedBoundKeys(factory, bytes(2, 0), bytes(2, 0), bytes(2, 0, 0));
+            assertReusedBoundKeys(factory, bytes(2), bytes(2, 0), bytes(2, 0, 0), bytes(2, 1));
+            assertReusedBoundKeys(factory, bytes(3), bytes(3, 0));
+        }
+    }
+
+    private void assertReusedBoundKeys(
+            PrefixBoundedIteratorFactory factory, byte[] prefix, byte[]... expectedKeys) {
+        try (RocksIteratorWrapper iterator = createIterator(factory, prefix)) {
+            assertThat(factory.isReusedBoundInUse()).isTrue();
+            assertKeys(iterator, prefix, expectedKeys);
+        }
+        assertThat(factory.isReusedBoundInUse()).isFalse();
+    }
+
+    @Test
+    void testClosingAnIteratorTwiceDoesNotReleaseTheBoundOfAnotherIterator()
+            throws RocksDBException {
+        putKeys(bytes(1, 0), bytes(2, 0), bytes(3, 0), bytes(4, 0));
+
+        try (PrefixBoundedIteratorFactory factory =
+                new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions())) {
+            final RocksIteratorWrapper closedTwice = createIterator(factory, bytes(1));
+            closedTwice.close();
+
+            try (RocksIteratorWrapper iterator = createIterator(factory, bytes(2))) {
+                closedTwice.close();
+                assertThat(factory.isReusedBoundInUse()).isTrue();
+
+                // If the buffer were free, this iterator would overwrite the bound in it.
+                try (RocksIteratorWrapper later = createIterator(factory, bytes(3))) {
+                    assertKeys(iterator, bytes(2), bytes(2, 0));
+                    assertKeys(later, bytes(3), bytes(3, 0));
+                }
+            }
+        }
+    }
+
+    @Test
+    void testFactoryBoundLongerThanTheReusedBuffer() throws RocksDBException {
+        final byte[] prefix = new byte[PrefixBoundedIteratorFactory.MAX_REUSED_BOUND_LENGTH + 1];
+        Arrays.fill(prefix, (byte) 1);
+        final byte[] firstKey = Arrays.copyOf(prefix, prefix.length + 1);
+        final byte[] secondKey = Arrays.copyOf(prefix, prefix.length + 1);
+        secondKey[prefix.length] = 1;
+        final byte[] nextPrefixKey = prefix.clone();
+        nextPrefixKey[prefix.length - 1] = 2;
+        putKeys(firstKey, secondKey, nextPrefixKey);
+
+        try (PrefixBoundedIteratorFactory factory =
+                        new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions());
+                RocksIteratorWrapper iterator = createIterator(factory, prefix)) {
+            assertThat(factory.isReusedBoundInUse()).isFalse();
+            assertKeys(iterator, prefix, firstKey, secondKey);
+        }
+    }
+
+    @Test
+    void testFactoryDoesNotInheritOrModifySharedOptions() throws RocksDBException {
+        final RocksDB db = rocksDBExtension.getRocksDB();
+        try (ColumnFamilyOptions options =
+                        new ColumnFamilyOptions().useFixedLengthPrefixExtractor(2);
+                ColumnFamilyHandle columnFamily =
+                        db.createColumnFamily(new ColumnFamilyDescriptor(bytes(42), options));
+                Slice lowerBound = new Slice(bytes(1, 1));
+                ReadOptions sharedOptions =
+                        new ReadOptions()
+                                .setPrefixSameAsStart(true)
+                                .setIterateLowerBound(lowerBound)) {
+            db.put(columnFamily, bytes(1, 0), bytes());
+            db.put(columnFamily, bytes(1, 1), bytes());
+            db.put(columnFamily, bytes(2, 0), bytes());
+
+            try (PrefixBoundedIteratorFactory factory =
+                            new PrefixBoundedIteratorFactory(sharedOptions);
+                    RocksIteratorWrapper iterator =
+                            factory.newIterator(db, columnFamily, bytes(1))) {
+                // The inherited lower bound would hide [1, 0], and prefixSameAsStart would stop
+                // before [1, 1], whose extracted prefix differs from the one of the seek key.
+                assertKeys(iterator, bytes(1, 0), bytes(1, 0), bytes(1, 1));
+            }
+
+            assertThat(sharedOptions.isOwningHandle()).isTrue();
+            assertThat(sharedOptions.prefixSameAsStart()).isTrue();
+            assertThat(sharedOptions.autoPrefixMode()).isFalse();
+            assertThat(sharedOptions.iterateLowerBound().data()).isEqualTo(bytes(1, 1));
+            assertThat(sharedOptions.iterateUpperBound()).isNull();
+        }
+    }
+
+    @Test
+    void testOverlappingIteratorsFromDifferentThreadsKeepTheirBounds() throws Exception {
+        putKeys(bytes(1, 0), bytes(2, 0), bytes(3, 0));
+        try (PrefixBoundedIteratorFactory factory =
+                new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions())) {
+            final ExecutorService executor = Executors.newSingleThreadExecutor();
+            try (RocksIteratorWrapper first = createIterator(factory, bytes(1))) {
+                assertThat(factory.isReusedBoundInUse()).isTrue();
+                final Future<?> second =
+                        executor.submit(
+                                () -> {
+                                    try (RocksIteratorWrapper iterator =
+                                            createIterator(factory, bytes(2))) {
+                                        assertKeys(iterator, bytes(2), bytes(2, 0));
+                                    }
+                                });
+                second.get(1, TimeUnit.MINUTES);
+                assertThat(factory.isReusedBoundInUse()).isTrue();
+                assertKeys(first, bytes(1), bytes(1, 0));
+            } finally {
+                executor.shutdownNow();
+                assertThat(executor.awaitTermination(1, TimeUnit.MINUTES)).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void testIteratorsCreatedFromSeveralThreadsKeepTheirBounds() throws Exception {
+        final int threads = 4;
+        final int iteratorsPerThread = 20_000;
+        for (int prefix = 1; prefix <= threads; prefix++) {
+            putKeys(bytes(prefix, 0), bytes(prefix, 1));
+        }
+
+        final ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try (PrefixBoundedIteratorFactory factory =
+                new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions())) {
+            final List<Future<?>> results = new ArrayList<>();
+            try {
+                for (int thread = 1; thread <= threads; thread++) {
+                    final int prefix = thread;
+                    results.add(
+                            executor.submit(
+                                    () -> {
+                                        for (int i = 0; i < iteratorsPerThread; i++) {
+                                            try (RocksIteratorWrapper iterator =
+                                                    createIterator(factory, bytes(prefix))) {
+                                                assertKeys(
+                                                        iterator,
+                                                        bytes(prefix),
+                                                        bytes(prefix, 0),
+                                                        bytes(prefix, 1));
+                                            }
+                                        }
+                                    }));
+                }
+                for (Future<?> result : results) {
+                    result.get();
+                }
+            } finally {
+                // The factory must stay open until no thread uses it any more.
+                executor.shutdown();
+                assertThat(executor.awaitTermination(1, TimeUnit.MINUTES)).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void testClosedFactoryRejectsNewIterators() {
+        final PrefixBoundedIteratorFactory factory =
+                new PrefixBoundedIteratorFactory(rocksDBExtension.getReadOptions());
+        factory.close();
+
+        assertThatThrownBy(() -> createIterator(factory, bytes(1)))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
     void testWrapperClosesOwnedResources() {
         final ReadOptions sharedOptions = rocksDBExtension.getReadOptions();
         try (TrackingSlice upperBound = new TrackingSlice(bytes(2));
@@ -185,6 +403,27 @@ class RocksDBPrefixIteratorTest {
             }
 
             assertThat(readOptions.isOwningHandle()).isTrue();
+        } finally {
+            db.releaseSnapshot(snapshot);
+        }
+    }
+
+    @Test
+    void testFactoryUsesReadOptionsFromItsCreation() throws RocksDBException {
+        final RocksDB db = rocksDBExtension.getRocksDB();
+        putKeys(bytes(1, 0));
+        final Snapshot snapshot = db.getSnapshot();
+        try (ReadOptions readOptions = new ReadOptions().setSnapshot(snapshot);
+                PrefixBoundedIteratorFactory factory =
+                        new PrefixBoundedIteratorFactory(readOptions)) {
+            readOptions.setSnapshot(null);
+            putKeys(bytes(1, 1));
+
+            try (RocksIteratorWrapper reusedBound = createIterator(factory, bytes(1));
+                    RocksIteratorWrapper ownBound = createIterator(factory, bytes(1))) {
+                assertKeys(reusedBound, bytes(1), bytes(1, 0));
+                assertKeys(ownBound, bytes(1), bytes(1, 0));
+            }
         } finally {
             db.releaseSnapshot(snapshot);
         }
@@ -422,6 +661,12 @@ class RocksDBPrefixIteratorTest {
                 rocksDBExtension.getDefaultColumnFamily(),
                 readOptions,
                 prefix);
+    }
+
+    private RocksIteratorWrapper createIterator(
+            PrefixBoundedIteratorFactory factory, byte[] prefix) {
+        return factory.newIterator(
+                rocksDBExtension.getRocksDB(), rocksDBExtension.getDefaultColumnFamily(), prefix);
     }
 
     private void putKeys(byte[]... keys) throws RocksDBException {
